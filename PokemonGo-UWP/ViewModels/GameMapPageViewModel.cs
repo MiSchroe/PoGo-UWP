@@ -7,6 +7,7 @@ using Windows.Devices.Geolocation;
 using Windows.UI.Popups;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Navigation;
+using Newtonsoft.Json;
 using PokemonGo.RocketAPI;
 using PokemonGo_UWP.Entities;
 using PokemonGo_UWP.Utils;
@@ -17,11 +18,42 @@ using POGOProtos.Networking.Responses;
 using Template10.Common;
 using Template10.Mvvm;
 using Resources = PokemonGo_UWP.Utils.Resources;
+using POGOProtos.Enums;
+using POGOProtos.Map.Pokemon;
 
 namespace PokemonGo_UWP.ViewModels
 {
     public class GameMapPageViewModel : ViewModelBase
     {
+
+        public GameMapPageViewModel()
+        {
+            if (Windows.ApplicationModel.DesignMode.DesignModeEnabled)
+            {
+                var poke1 = new NearbyPokemon()
+                {
+                    PokemonId = PokemonId.Abra,
+                    DistanceInMeters = 10,
+                };
+                var poke2 = new NearbyPokemon()
+                {
+                    PokemonId = PokemonId.Arbok,
+                    DistanceInMeters = 11,
+                };
+                var poke3 = new NearbyPokemon()
+                {
+                    PokemonId = PokemonId.Blastoise,
+                    DistanceInMeters = 12,
+                };
+                GameClient.NearbyPokemons.Add(new NearbyPokemonWrapper(poke1));
+                GameClient.NearbyPokemons.Add(new NearbyPokemonWrapper(poke2));
+                GameClient.NearbyPokemons.Add(new NearbyPokemonWrapper(poke3));
+                GameClient.PokedexInventory.Add(new PokedexEntry { PokemonId = poke1.PokemonId, TimesCaptured = 1 });
+                GameClient.PokedexInventory.Add(new PokedexEntry { PokemonId = poke2.PokemonId, TimesCaptured = 1 });
+            }
+        }
+
+
         #region Lifecycle Handlers
 
         /// <summary>
@@ -42,8 +74,8 @@ namespace PokemonGo_UWP.ViewModels
             if (suspensionState.Any())
             {
                 // Recovering the state
-                PlayerProfile = (PlayerData)suspensionState[nameof(PlayerProfile)];
-                PlayerStats = (PlayerStats)suspensionState[nameof(PlayerStats)];
+                PlayerProfile = JsonConvert.DeserializeObject<PlayerData>((string)suspensionState[nameof(PlayerProfile)]);
+                PlayerStats = JsonConvert.DeserializeObject<PlayerStats>((string)suspensionState[nameof(PlayerStats)]);
                 // Restarting update service
                 await StartGpsDataService();
                 return;
@@ -56,19 +88,19 @@ namespace PokemonGo_UWP.ViewModels
                     // App just started, so we get GPS access and eventually initialize the client
                     await StartGpsDataService();
                     await UpdatePlayerData(true);
-                    await GameClient.ToggleUpdateTimer();
+                    GameClient.ToggleUpdateTimer();
                     break;
                 case GameMapNavigationModes.SettingsUpdate:
                     // We navigated back from Settings page after changing the Map provider, but this is managed in the page itself
                     break;
                 case GameMapNavigationModes.PokestopUpdate:
                     // We came here after the catching page so we need to restart map update timer and update player data. We also check for level up.
-                    await GameClient.ToggleUpdateTimer();
+                    GameClient.ToggleUpdateTimer();
                     await UpdatePlayerData(true);
                     break;
                 case GameMapNavigationModes.PokemonUpdate:
                     // As above
-                    await GameClient.ToggleUpdateTimer();
+                    GameClient.ToggleUpdateTimer();
                     await UpdatePlayerData(true);
                     break;
                 default:
@@ -86,8 +118,8 @@ namespace PokemonGo_UWP.ViewModels
         {
             if (suspending)
             {
-                suspensionState[nameof(PlayerProfile)] = PlayerProfile;
-                suspensionState[nameof(PlayerStats)] = PlayerStats;
+                suspensionState[nameof(PlayerProfile)] = JsonConvert.SerializeObject(PlayerProfile);
+                suspensionState[nameof(PlayerStats)] = JsonConvert.SerializeObject(PlayerStats);
             }
             await Task.CompletedTask;
         }
@@ -212,6 +244,7 @@ namespace PokemonGo_UWP.ViewModels
                 }
             });
         }
+
 
         /// <summary>
         ///     Updates player profile & stats

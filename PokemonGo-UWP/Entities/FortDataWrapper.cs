@@ -2,16 +2,17 @@
 using System.ComponentModel;
 using Windows.Devices.Geolocation;
 using Windows.Foundation;
-using GeoExtensions;
 using Google.Protobuf;
 using PokemonGo.RocketAPI.Extensions;
 using PokemonGo_UWP.Utils;
 using PokemonGo_UWP.Utils.Game;
+using PokemonGo_UWP.Utils.Helpers;
 using PokemonGo_UWP.Views;
 using POGOProtos.Enums;
 using POGOProtos.Map.Fort;
 using Template10.Common;
 using Template10.Mvvm;
+using Google.Protobuf.Collections;
 
 namespace PokemonGo_UWP.Entities
 {
@@ -27,8 +28,7 @@ namespace PokemonGo_UWP.Entities
         public FortDataStatus FortDataStatus {
             get
             {
-                var distance = GeoAssist.CalculateDistanceBetweenTwoGeoPoints(Geoposition,
-                GameClient.Geoposition.Coordinate.Point);
+                var distance = GeoHelper.Distance(Geoposition, GameClient.Geoposition.Coordinate.Point);
                 FortDataStatus retVal = FortDataStatus.Opened;
 
                 if (distance > GameClient.GameSetting.FortSettings.InteractionRangeMeters)
@@ -36,6 +36,9 @@ namespace PokemonGo_UWP.Entities
 
                 if(CooldownCompleteTimestampMs > DateTime.UtcNow.ToUnixTime())
                     retVal |= FortDataStatus.Cooldown;
+
+                if(_fortData.LureInfo != null && _fortData.LureInfo.LureExpiresTimestampMs > DateTime.UtcNow.ToUnixTime())
+                    retVal |= FortDataStatus.Lure;
 
                 return retVal;
             }
@@ -59,11 +62,11 @@ namespace PokemonGo_UWP.Entities
         ///     the actual capture method.
         /// </summary>
         public DelegateCommand TrySearchPokestop => _trySearchPokestop ?? (
-            _trySearchPokestop = new DelegateCommand(async () =>
+            _trySearchPokestop = new DelegateCommand(() =>
             {
                 NavigationHelper.NavigationState["CurrentPokestop"] = this;
                 // Disable map update
-                await GameClient.ToggleUpdateTimer(false);
+                GameClient.ToggleUpdateTimer(false);
                 BootStrapper.Current.NavigationService.Navigate(typeof(SearchPokestopPage));
             }, () => true)
             );
@@ -103,7 +106,7 @@ namespace PokemonGo_UWP.Entities
 
         public FortType Type => _fortData.Type;
 
-        public ByteString ActiveFortModifier => _fortData.ActiveFortModifier;
+        public RepeatedField<POGOProtos.Inventory.Item.ItemId> ActiveFortModifier => _fortData.ActiveFortModifier;
 
         public long CooldownCompleteTimestampMs => _fortData.CooldownCompleteTimestampMs;
 

@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Windows.ApplicationModel;
 using Windows.Devices.Geolocation;
@@ -30,6 +32,12 @@ using Template10.Common;
 using Template10.Utils;
 using Universal_Authenticator_v2.Views;
 using Windows.Devices.Sensors;
+using Newtonsoft.Json;
+using PokemonGo.RocketAPI.Rpc;
+using PokemonGoAPI.Session;
+using PokemonGo_UWP.Utils.Helpers;
+using System.Collections.Specialized;
+using Windows.UI.Popups;
 
 namespace PokemonGo_UWP.Utils
 {
@@ -44,39 +52,120 @@ namespace PokemonGo_UWP.Utils
         private static Client _client;
 
         /// <summary>
-        ///     Handles failures by having a fixed number of retries
+        /// Handles map updates using Niantic's logic.
+        /// Ported from <seealso cref="https://github.com/AeonLucid/POGOLib"/>
         /// </summary>
-        internal class ApiFailure : IApiFailureStrategy
+        private class Heartbeat
         {
-            private const int MaxRetries = 50;
+            /// <summary>
+            ///     Determines whether we can keep heartbeating.
+            /// </summary>
+            private bool _keepHeartbeating = true;
 
-            private int _retryCount;
+            /// <summary>
+            /// Timer used to update map
+            /// </summary>
+            private DispatcherTimer _mapUpdateTimer;
 
+            /// <summary>
+            /// True if another update operation is in progress.
+            /// </summary>
+            private bool _isHeartbeating;
 
-            public async Task<ApiOperation> HandleApiFailure(RequestEnvelope request, ResponseEnvelope response)
+            /// <summary>
+            /// Checks if we need to update data
+            /// </summary>
+            /// <param name="sender"></param>
+            /// <param name="o"></param>
+            private async void HeartbeatTick(object sender, object o)
             {
-                if (_retryCount == MaxRetries)
-                    return ApiOperation.Abort;
+                // We need to skip this iteration
+                if (!_keepHeartbeating || _isHeartbeating) return;
+                _isHeartbeating = true;
+                // Heartbeat is alive so we check if we need to update data, based on GameSettings
+                var canRefresh = false;
 
-                await Task.Delay(500);
-                _retryCount++;
 
-                if (_retryCount % 5 == 0)
+                //Collect location data for signature
+                DeviceInfos.Instance.CollectLocationData();
+
+                // We have no settings yet so we just update without further checks
+                if (GameSetting == null)
                 {
-                    await DoRelogin();
-                    Debug.WriteLine("[Relogin] Stopping API via ApiHandledException.");
-                    throw new ApiHandledException("Relogin completed.");
+                    canRefresh = true;
                 }
-
-                return ApiOperation.Retry;
+                else
+                {
+                    // Check if we need to update                
+                    var minSeconds = GameSetting.MapSettings.GetMapObjectsMinRefreshSeconds;
+                    var maxSeconds = GameSetting.MapSettings.GetMapObjectsMaxRefreshSeconds;
+                    var minDistance = GameSetting.MapSettings.GetMapObjectsMinDistanceMeters;
+                    var lastGeoCoordinate = _lastGeopositionMapObjectsRequest;
+                    var secondsSinceLast = DateTime.Now.Subtract(BaseRpc.LastRpcRequest).Seconds;
+                    if (lastGeoCoordinate == null)
+                    {
+                        Logger.Write("Refreshing MapObjects, reason: 'lastGeoCoordinate == null'.");
+                        canRefresh = true;
+                    }
+                    else if (secondsSinceLast >= minSeconds)
+                    {
+                        var metersMoved = GeoHelper.Distance(Geoposition.Coordinate.Point, lastGeoCoordinate.Coordinate.Point);
+                        if (secondsSinceLast >= maxSeconds)
+                        {
+                            Logger.Write($"Refreshing MapObjects, reason: 'secondsSinceLast({secondsSinceLast}) >= maxSeconds({maxSeconds})'.");
+                            canRefresh = true;
+                        }
+                        else if (metersMoved >= minDistance)
+                        {
+                            Logger.Write($"Refreshing MapObjects, reason: 'metersMoved({metersMoved}) >= minDistance({minDistance})'.");
+                            canRefresh = true;
+                        }
+                    }
+                } 
+                // Update!
+                if (!canRefresh)
+                {
+                    _isHeartbeating = false;
+                    return;
+                }
+                try
+                {
+                    await UpdateMapObjects();
+                }
+                catch (Exception ex)
+                {
+                    await ExceptionHandler.HandleException(ex);
+                }
+                finally
+                {
+                    _isHeartbeating = false;
+                }
             }
 
-            public void HandleApiSuccess(RequestEnvelope request, ResponseEnvelope response)
+            /// <summary>
+            /// Inits heartbeat
+            /// </summary>
+            internal async Task StartDispatcher()
             {
-                _retryCount = 0;
+                _keepHeartbeating = true;
+                if (_mapUpdateTimer != null) return;
+
+                await DispatcherHelper.RunInDispatcherAndAwait(() =>
+                {
+                    _mapUpdateTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                    _mapUpdateTimer.Tick += HeartbeatTick;
+                    _mapUpdateTimer.Start();
+                });
+            }
+
+            /// <summary>
+            /// Stops heartbeat
+            /// </summary>
+            internal void StopDispatcher()
+            {
+                _keepHeartbeating = false;
             }
         }
-
         #endregion
 
         #region Game Vars
@@ -125,13 +214,13 @@ namespace PokemonGo_UWP.Utils
         ///     Collection of Pokemon in 2 steps from current position
         /// </summary>
         public static ObservableCollection<NearbyPokemonWrapper> NearbyPokemons { get; set; } =
-            new ObservableCollection<NearbyPokemonWrapper>
-            {
-                //To prevent errors from NearbyPokemons[0-2].PokemonId in GameMapPage.xaml
-                new NearbyPokemonWrapper(new NearbyPokemon {PokemonId = 0}),
-                new NearbyPokemonWrapper(new NearbyPokemon {PokemonId = 0}),
-                new NearbyPokemonWrapper(new NearbyPokemon {PokemonId = 0})
-            };
+            new ObservableCollection<NearbyPokemonWrapper>();
+            //{
+            //    //To prevent errors from NearbyPokemons[0-2].PokemonId in GameMapPage.xaml
+            //    new NearbyPokemonWrapper(new NearbyPokemon {PokemonId = 0}),
+            //    new NearbyPokemonWrapper(new NearbyPokemon {PokemonId = 0}),
+            //    new NearbyPokemonWrapper(new NearbyPokemon {PokemonId = 0})
+            //};
 
         /// <summary>
         ///     Collection of Pokestops in the current area
@@ -178,8 +267,8 @@ namespace PokemonGo_UWP.Utils
         /// <summary>
         ///     Stores player's current Pokedex
         /// </summary>
-        public static ObservableCollection<PokedexEntry> PokedexInventory { get; set; } =
-            new ObservableCollection<PokedexEntry>();
+        public static ObservableCollectionPlus<PokedexEntry> PokedexInventory { get; set; } =
+            new ObservableCollectionPlus<PokedexEntry>();
 
         /// <summary>
         ///     Stores player's current candies
@@ -209,9 +298,56 @@ namespace PokemonGo_UWP.Utils
 
         #endregion
 
+        #region Constructor
+
+        static GameClient()
+        {
+            PokedexInventory.CollectionChanged += PokedexInventory_CollectionChanged;
+            // TODO: Investigate whether or not this needs to be unsubscribed when the app closes.
+        }
+
+        /// <summary>
+        /// When new items are added to the Pokedex, reset the Nearby Pokemon so their state can be re-run.
+        /// </summary>
+        /// <remarks>
+        /// This exists because the Nearby Pokemon are Map objects, and are loaded before Inventory. If you don't do this,
+        /// the first Nearby items are always shown as "new to the Pokedex" until they disappear, regardless of if they are
+        /// ACTUALLY new.
+        /// </remarks>
+        private static void PokedexInventory_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
+        {
+            if (e.Action == NotifyCollectionChangedAction.Add)
+            {
+                // advancedrei: This is a total order-of-operations hack.
+                var nearby = NearbyPokemons.ToList();
+                NearbyPokemons.Clear();
+                NearbyPokemons.AddRange(nearby);
+            }
+        }
+
+        #endregion
+
         #region Game Logic
 
         #region Login/Logout
+
+        /// <summary>
+        /// Saves the new AccessToken to settings.        
+        /// </summary>
+        private static void SaveAccessToken()
+        {
+            SettingsService.Instance.AccessTokenString = JsonConvert.SerializeObject(_client.AccessToken);
+        }
+
+        /// <summary>
+        /// Loads current AccessToken
+        /// </summary>
+        /// <returns></returns>
+        public static AccessToken LoadAccessToken()
+        {
+            var tokenString = SettingsService.Instance.AccessTokenString;
+            return tokenString == null ? null : JsonConvert.DeserializeObject<AccessToken>(SettingsService.Instance.AccessTokenString);
+        }
 
         /// <summary>
         ///     Sets things up if we didn't come from the login page
@@ -233,10 +369,11 @@ namespace PokemonGo_UWP.Utils
                 GooglePassword = SettingsService.Instance.LastLoginService == AuthType.Google ? credentials.Password : null,
             };
 
-            _client = new Client(_clientSettings, new ApiFailure(), DeviceInfos.Instance)
-            {
-                AuthToken = SettingsService.Instance.AuthToken
-            };
+            _client = new Client(_clientSettings, null, DeviceInfos.Instance) {AccessToken = LoadAccessToken()};
+            var apiFailureStrategy = new ApiFailureStrategy(_client);
+            _client.ApiFailure = apiFailureStrategy;
+            // Register to AccessTokenChanged       
+            apiFailureStrategy.OnAccessTokenUpdated += (s, e) => SaveAccessToken();
             try
             {
                 await _client.Login.DoLogin();
@@ -246,28 +383,12 @@ namespace PokemonGo_UWP.Utils
                 if (e is PokemonGo.RocketAPI.Exceptions.AccessTokenExpiredException)
                 {
                     Debug.WriteLine("AccessTokenExpired Exception caught");
-                    Debug.WriteLine("Loging in now");
-                    await Relogin();
+                    await _client.Login.DoLogin();
                 }
-                else throw;
-            }
-        }
-        public static async Task<bool> Relogin()
-        {
-            switch (_clientSettings.AuthType)
-            {
-                case AuthType.Ptc:
-                    {
-                        return await DoPtcLogin(_clientSettings.PtcUsername, _clientSettings.PtcPassword);
-                    }
-                case AuthType.Google:
-                    {
-                        return await DoGoogleLogin(_clientSettings.GoogleUsername, _clientSettings.GooglePassword);
-                    }
-                default:
-                    {
-                        throw new InvalidOperationException();
-                    }
+                else
+                {
+                    await new MessageDialog(e.Message).ShowAsyncQueue();
+                }
             }
         }
 
@@ -285,13 +406,17 @@ namespace PokemonGo_UWP.Utils
                 PtcPassword = password,
                 AuthType = AuthType.Ptc
             };
-            _client = new Client(_clientSettings, new ApiFailure(), DeviceInfos.Instance);
+            _client = new Client(_clientSettings, null, DeviceInfos.Instance);
+            var apiFailureStrategy = new ApiFailureStrategy(_client);
+            _client.ApiFailure = apiFailureStrategy;
+            // Register to AccessTokenChanged       
+            apiFailureStrategy.OnAccessTokenUpdated += (s, e) => SaveAccessToken();
             // Get PTC token
-            var authToken = await _client.Login.DoLogin();
+            await _client.Login.DoLogin();
             // Update current token even if it's null and clear the token for the other identity provide
-            SettingsService.Instance.AuthToken = authToken;
+            SaveAccessToken();
             // Update other data if login worked
-            if (authToken == null) return false;
+            if (_client.AccessToken == null) return false;
             SettingsService.Instance.LastLoginService = AuthType.Ptc;
             SettingsService.Instance.UserCredentials =
                 new PasswordCredential(nameof(SettingsService.Instance.UserCredentials), username, password);
@@ -314,13 +439,17 @@ namespace PokemonGo_UWP.Utils
                 AuthType = AuthType.Google
             };
 
-            _client = new Client(_clientSettings, new ApiFailure(), DeviceInfos.Instance);
+            _client = new Client(_clientSettings, null, DeviceInfos.Instance);
+            var apiFailureStrategy = new ApiFailureStrategy(_client);
+            _client.ApiFailure = apiFailureStrategy;
+            // Register to AccessTokenChanged       
+            apiFailureStrategy.OnAccessTokenUpdated += (s, e) => SaveAccessToken();
             // Get Google token
-            var authToken = await _client.Login.DoLogin();
-            // Update current token even if it's null
-            SettingsService.Instance.AuthToken = authToken;
+            await _client.Login.DoLogin();
+            // Update current token even if it's null and clear the token for the other identity provide
+            SaveAccessToken();
             // Update other data if login worked
-            if (authToken == null) return false;
+            if (_client.AccessToken == null) return false;
             SettingsService.Instance.LastLoginService = AuthType.Google;
             SettingsService.Instance.UserCredentials =
                 new PasswordCredential(nameof(SettingsService.Instance.UserCredentials), email, password);
@@ -331,43 +460,19 @@ namespace PokemonGo_UWP.Utils
         /// <summary>
         ///     Logs the user out by clearing data and timers
         /// </summary>
-        public static void DoLogout()
+        public static async void DoLogout()
         {
             // Clear stored token
-            SettingsService.Instance.AuthToken = null;
+            SettingsService.Instance.AccessTokenString = null;
             if (!SettingsService.Instance.RememberLoginData)
                 SettingsService.Instance.UserCredentials = null;
-            _mapUpdateTimer?.Stop();
-            _mapUpdateTimer = null;
+            _heartbeat?.StopDispatcher();
             _geolocator.PositionChanged -= GeolocatorOnPositionChanged;
             _geolocator = null;
+            _lastGeopositionMapObjectsRequest = null;
             CatchablePokemons.Clear();
             NearbyPokemons.Clear();
             NearbyPokestops.Clear();
-        }
-
-        public static async Task DoRelogin()
-        {
-            Debug.WriteLine("[Relogin] Started.");
-            DoLogout();
-
-            var token = _client.AuthToken;
-
-            await
-                (_clientSettings.AuthType == AuthType.Google
-                    ? DoGoogleLogin(_clientSettings.GoogleUsername, _clientSettings.GooglePassword)
-                    : DoPtcLogin(_clientSettings.PtcUsername, _clientSettings.PtcPassword));
-
-            if (token != _client.AuthToken)
-                Debug.WriteLine("[Relogin] Token successfuly changed.");
-
-            Debug.WriteLine("[Relogin] Reloading gps and playerdata.");
-            await InitializeDataUpdate();
-            await UpdateProfile();
-            await UpdatePlayerStats();
-            Debug.WriteLine("[Relogin] Restarting MapUpdate timer.");
-            _lastUpdate = DateTime.Now;
-            await ToggleUpdateTimer();
         }
 
         #endregion
@@ -379,9 +484,7 @@ namespace PokemonGo_UWP.Utils
 
         public static Geoposition Geoposition { get; private set; }
 
-        public static double Heading { get; private set; }
-
-        private static DispatcherTimer _mapUpdateTimer;
+        private static Heartbeat _heartbeat;
         private static DispatcherTimer _compassTimer;
 
         /// <summary>
@@ -396,27 +499,30 @@ namespace PokemonGo_UWP.Utils
         /// </summary>
         public static async Task InitializeDataUpdate()
         {
-            _compass = Compass.GetDefault();
-            _compassTimer = new DispatcherTimer
+            if (SettingsService.Instance.IsCompassEnabled)
             {
-                Interval = TimeSpan.FromMilliseconds(Math.Max(_compass.MinimumReportInterval, 50))
-            };
-            _compassTimer.Tick += (s, e) =>
-            {
-                if (SettingsService.Instance.IsAutoRotateMapEnabled)
+                _compass = Compass.GetDefault();
+                if (_compass != null)
                 {
-                    HeadingUpdated?.Invoke(null, _compass.GetCurrentReading());
+                    _compassTimer = new DispatcherTimer
+                    {
+                        Interval = TimeSpan.FromMilliseconds(Math.Max(_compass.MinimumReportInterval, 50))
+                    };
+                    _compassTimer.Tick += (s, e) =>
+                    {
+                        if (SettingsService.Instance.IsAutoRotateMapEnabled)
+                        {
+                            HeadingUpdated?.Invoke(null, _compass.GetCurrentReading());
+                        }
+                    };
+                    _compassTimer.Start();
                 }
-            };
-            if (_compass != null)
-            {
-                _compassTimer.Start();
             }
             _geolocator = new Geolocator
             {
                 DesiredAccuracy = PositionAccuracy.High,
                 DesiredAccuracyInMeters = 5,
-                ReportInterval = 5000,
+                ReportInterval = 1000,
                 MovementThreshold = 5
             };
 
@@ -431,29 +537,12 @@ namespace PokemonGo_UWP.Utils
                         DateTime.Now.AddMonths(1));
             // Update geolocator settings based on server
             _geolocator.MovementThreshold = GameSetting.MapSettings.GetMapObjectsMinDistanceMeters;
-            _mapUpdateTimer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromSeconds(GameSetting.MapSettings.GetMapObjectsMinRefreshSeconds)
-            };
-            _mapUpdateTimer.Tick += async (s, e) =>
-            {
-                // Update before starting but only if more than 10s passed since the last one
-                if ((DateTime.Now - _lastUpdate).Seconds <= GameSetting.MapSettings.GetMapObjectsMinRefreshSeconds)
-                    return;
-                Logger.Write("Updating map");
-
-                try
-                {
-                    await UpdateMapObjects();
-                }
-                catch (Exception ex)
-                {
-                    await ExceptionHandler.HandleException(ex);
-                }
-            };
+            if (_heartbeat == null)
+                _heartbeat = new Heartbeat();
+            await _heartbeat.StartDispatcher();
             // Update before starting timer
             Busy.SetBusy(true, Resources.CodeResources.GetString("GettingUserDataText"));
-            await UpdateMapObjects();
+            //await UpdateMapObjects();
             await UpdateInventory();
             await UpdateItemTemplates();
             Busy.SetBusy(false);
@@ -478,19 +567,13 @@ namespace PokemonGo_UWP.Utils
         ///     Toggles the update timer based on the isEnabled value
         /// </summary>
         /// <param name="isEnabled"></param>
-        public static async Task ToggleUpdateTimer(bool isEnabled = true)
+        public static async void ToggleUpdateTimer(bool isEnabled = true)
         {
             if (isEnabled)
-            {
-                if (_mapUpdateTimer.IsEnabled) return;
-                // Update before starting but only if more than 10s passed since the last one
-                if ((DateTime.Now - _lastUpdate).Seconds > GameSetting.MapSettings.GetMapObjectsMinRefreshSeconds)
-                    await UpdateMapObjects();
-                _mapUpdateTimer.Start();
-            }
+                await _heartbeat.StartDispatcher();
             else
             {
-                _mapUpdateTimer.Stop();
+                _heartbeat.StopDispatcher();
             }
         }
 
@@ -532,18 +615,21 @@ namespace PokemonGo_UWP.Utils
 
         #region Map & Position
 
+        private static Geoposition _lastGeopositionMapObjectsRequest;
+
         /// <summary>
         ///     Gets updated map data based on provided position
         /// </summary>
         /// <param name="geoposition"></param>
         /// <returns></returns>
-        public static async
+        private static async
             Task
                 <
                     Tuple
                         <GetMapObjectsResponse, GetHatchedEggsResponse, GetInventoryResponse, CheckAwardedBadgesResponse,
                             DownloadSettingsResponse>> GetMapObjects(Geoposition geoposition)
         {
+            _lastGeopositionMapObjectsRequest = geoposition;      
             return await _client.Map.GetMapObjects();
         }
 
@@ -617,8 +703,7 @@ namespace PokemonGo_UWP.Utils
         }
 
         /// <summary>
-        ///     Pokedex extra data doesn't change so we can just call this method once.
-        ///     TODO: store it in local settings maybe?
+        ///     Pokedex extra data doesn't change so we can just call this method once.        
         /// </summary>
         /// <returns></returns>
         private static async Task UpdateItemTemplates()
@@ -665,7 +750,8 @@ namespace PokemonGo_UWP.Utils
         public static async Task UpdateInventory()
         {
             // Get ALL the items
-            var fullInventory = (await GetInventory()).InventoryDelta.InventoryItems;
+            var response = await GetInventory();
+            var fullInventory = response.InventoryDelta?.InventoryItems;
             // Update items
             ItemsInventory.AddRange(fullInventory.Where(item => item.InventoryItemData.Item != null)
                 .GroupBy(item => item.InventoryItemData.Item)
@@ -685,15 +771,15 @@ namespace PokemonGo_UWP.Utils
                 .SelectMany(item => item.InventoryItemData.EggIncubators.EggIncubator)
                 .Where(item => item != null && item.PokemonId != 0), true);
 
+            // Update Pokedex
+            PokedexInventory.AddRange(fullInventory.Where(item => item.InventoryItemData.PokedexEntry != null)
+                .Select(item => item.InventoryItemData.PokedexEntry), true);
+
             // Update Pokemons
             PokemonsInventory.AddRange(fullInventory.Select(item => item.InventoryItemData.PokemonData)
                 .Where(item => item != null && item.PokemonId > 0), true);
             EggsInventory.AddRange(fullInventory.Select(item => item.InventoryItemData.PokemonData)
-                .Where(item => item != null && item.IsEgg), true);
-
-            // Update Pokedex
-            PokedexInventory.AddRange(fullInventory.Where(item => item.InventoryItemData.PokedexEntry != null)
-                .Select(item => item.InventoryItemData.PokedexEntry), true);
+                .Where(item => item != null && item.IsEgg), true);            
 
             // Update candies
             CandyInventory.AddRange(from item in fullInventory
